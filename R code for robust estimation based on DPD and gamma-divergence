@@ -1,0 +1,129 @@
+####  Loading Required Packages  ####
+packages <- c("numDeriv", "statmod", "mirt", "dplyr", "matrixStats")
+installed_packages <- installed.packages()
+for (pkg in packages) {
+  if (!pkg %in% installed_packages[, "Package"]) {
+    install.packages(pkg)
+  }
+}
+lapply(packages, library, character.only = TRUE)
+
+###--- Input Data ---###
+# Define constants and load data
+U <- ### (Data to analyze)
+beta <- 0.3   # Hyperparameter for DPD
+gamma <- 0.3  # Hyperparameter for gamma-divergence
+D <- 1.702    # Scale factor
+M <- 21       # Number of Gauss-Hermite quadrature nodes
+
+# Gauss-Hermite quadrature nodes and weights
+gh_points <- gauss.quad.prob(M, dist = "normal")
+X <- gh_points$nodes
+weights <- gh_points$weights
+
+###--- ICC (Item Characteristic Curve) ---###
+P <- function(theta, b) {
+  1 / (1 + exp(-D * (theta - b)))
+}
+
+###--- Probability Functions ---###
+# Probability of response u given theta and b
+Prob <- function(u, theta, b) {
+  P(theta, b)^u * (1 - P(theta, b))^(1 - u)
+}
+
+# Matrix versions of probability functions for efficiency
+P_m <- function(theta, b) {
+  cbind(1 - P(theta, b), P(theta, b))
+}
+
+Prob_m <- function(u, theta, b) {
+  sapply(1:J, function(j) P(theta, b[j])^u * (1 - P(theta, b[j]))^(1 - u))
+}
+
+Prob_matrix <- function(U, theta, b) {
+  P_theta_b <- P(theta, b)
+  P_matrix <- matrix(P_theta_b, nrow = nrow(U), ncol = ncol(U), byrow = TRUE)
+  P_matrix^U * (1 - P_matrix)^(1 - U)
+}
+
+log_prob <- function(b, U, j) {
+  U[, j] %*% t(as.matrix(log(P(X, b)))) + (1 - U[, j]) %*% t(as.matrix(log(1 - P(X, b))))
+}
+
+###--- Initialization ---###
+tol <- 1e-4    # Convergence threshold
+max_iter <- 30 # Maximum number of iterations
+
+# Create delta array for response encoding
+delta <- array(0, dim = c(I, J, 2))
+for (i in 1:I) {
+  for (j in 1:J) {
+    for (k in 1:2) {
+      delta[i, j, k] <- ifelse(U[i, j] == k - 1, 1, 0)
+    }
+  }
+}
+
+###--- Marginal Maximum Likelihood Estimation (MMLE) ---###
+model_mirt <- mirt(U, model = 1, itemtype = 'Rasch')
+b_mirt <- sapply(1:J, function(j) {
+  item_name <- paste0("Item_", j)
+  -coef(model_mirt)[[item_name]][, 2] / D  # Align the scale
+})
+
+###--- Weighted MMLE by Hong and Cheng (2019) ---###
+per.fit <- personfit(model_mirt, method = "ML")$Zh
+weights_adjusted <- pnorm(per.fit) * nrow(U) / sum(pnorm(per.fit))
+model_weighted <- mirt(U, 1, itemtype = 'Rasch', survey.weights = weights_adjusted)
+b_weight <- sapply(1:J, function(j) {
+  item_name <- paste0("Item_", j)
+  -coef(model_weighted)[[item_name]][, 2] / D
+})
+print(b_weight)  # Output the estimator
+
+###--- Robust Estimation Based on DPD ---###
+b_beta <- b_new <- b_mirt  # Initial values from MMLE
+for (iter in 1:max_iter) {
+  joint <- matrix(0, nrow = I, ncol = M)
+  for (m in 1:M) {
+    joint[, m] <- exp(rowSums(sapply(1:J, function(j) {
+      delta[, j, ] %*% t(log(P_m(X[m], b_beta[j])))
+    }))) * weights[m]
+  }
+  G1 <- joint / rowSums(joint)
+  ob <- function(b) {
+    terms <- lapply(1:J, function(j) log_prob(b[j], U, j))
+    term_sum <- Reduce("+", terms)
+    term1 <- sum(colSums(exp(beta * term_sum) * G1)) / (I * beta)
+    term2 <- 1 / (1 + beta) * sum((rowProds(Prob_m(1, X, b)^(1 + beta) + Prob_m(0, X, b)^(1 + beta))) * weights)
+    -term1 + term2
+  }
+  b_new <- optim(b_beta, fn = ob, method = "L-BFGS-B", lower = -4, upper = 4)$par
+  if (max(abs(b_new - b_beta)) < tol) break
+  b_beta <- b_new
+}
+print(b_beta)  # Output the estimator
+
+###--- Robust Estimation Based on Gamma-Divergence ---###
+b_gamma <- b_new <- b_mirt  # Initial values from MMLE
+for (iter in 1:max_iter) {
+  joint <- matrix(0, nrow = I, ncol = M)
+  for (m in 1:M) {
+    joint[, m] <- exp(rowSums(sapply(1:J, function(j) {
+      delta[, j, ] %*% t(log(P_m(X[m], b_gamma[j])))
+    }))) * weights[m]
+  }
+  G1 <- joint / rowSums(joint)
+  ob <- function(b) {
+    terms <- lapply(1:J, function(j) log_prob(b[j], U, j))
+    term_sum <- Reduce("+", terms)
+    term1 <- log(sum(colSums(exp(gamma * term_sum) * G1)) / I) / gamma
+    term2 <- log(sum((rowProds(Prob_m(1, X, b)^(1 + gamma) + Prob_m(0, X, b)^(1 + gamma))) * weights)) / (1 + gamma)
+    -term1 + term2
+  }
+  b_new <- optim(b_gamma, fn = ob, method = "L-BFGS-B", lower = -4, upper = 4)$par
+  if (max(abs(b_new - b_gamma)) < tol) break
+  b_gamma <- b_new
+}
+print(b_gamma)  # Output the estimator
